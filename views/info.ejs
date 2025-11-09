@@ -54,18 +54,32 @@
 <body>
   <h1>suck</h1>
   <p>This game sucks.</p>
-  <p><a href="/game">Click here to play</a></p>
+
   <% if (user.name) { %>
-    <p>Welcome back, <%- user.name %></p>
-    <p>Your biggest suck was <%- user.top_score %></p>
+  <p>Welcome back, <%- user.name %></p>
+  <p>Your biggest suck was <%- user.top_score %></p>
+
+  <div id="paymentSection">
+    <form id="purchaseForm">
+      <% if (!user.hasSavedPin) { %>
+      <input type="number" id="pinInput" placeholder="Enter PIN" required style="font-family: BubbleGums; font-size: 1em; padding: 5px; margin: 5px;">
+      <br>
+      <label style="margin: 10px;">
+        <input type="checkbox" id="savePinCheck"> Save PIN for quick rebuy
+      </label>
+      <br>
+      <% } %>
+      <button type="submit" style="text-shadow: #00FF00 1px 1px; color: black; font-family: BubbleGums; font-size: 1em; padding: 10px 20px; cursor: pointer; margin: 10px;">Pay 25 Digipogs & Play</button>
+    </form>
+  </div>
   <% } else { %>
-    <p><a href="/login">or log in first</a></p>
+  <p><a href="/login">Log in to play</a></p>
   <% } %>
   <h2>What is suck?</h2>
   <p>suck is basically agar.io, except it sucks.</p>
   <ul>
     <li>
-        You are a suck.
+      You are a suck.
     </li>
     <li>
       Suck up smaller sucks to become bigger suck.
@@ -79,6 +93,65 @@
   <p><b><%- game.top_name %></b> was the biggest suck of all time. ( <b><%- game.top_score %></b> )</p>
   <p>People have attempted to be the biggest suck <b><%- game.hits_game %></b> times.</p>
   <p><b><%- game.hits_home %></b> people have read this sentence.</p>
+
+  <% if (user.name) { %>
+  <script>
+    // Handle purchase form submission
+    const hasSavedPin = <%= user.hasSavedPin ? 'true' : 'false' %>;
+    
+    document.getElementById('purchaseForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+
+      const submitBtn = e.target.querySelector('button[type="submit"]');
+      const originalText = submitBtn.textContent;
+      
+      submitBtn.textContent = 'Processing...';
+      submitBtn.disabled = true;
+
+      try {
+        let body;
+        if (hasSavedPin) {
+          body = JSON.stringify({ useSaved: true });
+        } else {
+          const pin = parseInt(document.getElementById('pinInput').value);
+          const savePIN = document.getElementById('savePinCheck').checked;
+          body = JSON.stringify({ pin, savePIN });
+        }
+
+        const response = await fetch('/purchase', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: body
+        });
+
+        const result = await response.json();
+
+        if (result.success) {
+          submitBtn.textContent = 'Success! Loading game...';
+          window.location.href = '/game';
+        } else {
+          submitBtn.textContent = result.message;
+          submitBtn.style.backgroundColor = '#FF0000';
+          setTimeout(() => {
+            submitBtn.textContent = originalText;
+            submitBtn.style.backgroundColor = '';
+            submitBtn.disabled = false;
+          }, 3000);
+        }
+      } catch (error) {
+        submitBtn.textContent = 'Error! Try again';
+        submitBtn.style.backgroundColor = '#FF0000';
+        setTimeout(() => {
+          submitBtn.textContent = originalText;
+          submitBtn.style.backgroundColor = '';
+          submitBtn.disabled = false;
+        }, 3000);
+      }
+    });
+  </script>
+  <% } %>
 </body>
 
 </html>

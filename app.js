@@ -18,6 +18,8 @@ const jwt = require('jsonwebtoken');
 const { log } = require('console');
 // import custome GameCode
 const GameCode = require('./GameCode.js');
+// import socket.io-client for Formbar Digipog API
+const io = require('socket.io-client');
 
 // Load the settings from the environment variables
 // To set your own, make a file called ".env",
@@ -26,11 +28,15 @@ const GameCode = require('./GameCode.js');
 // The port to run this on
 const PORT = process.env.PORT || 3000;
 // The URL for the Formbar authentication server
-const AUTH_URL = process.env.AUTH_URL || 'http://localhost:420/oauth';
+const AUTH_URL = (process.env.FORMBAR_URL || 'http://localhost:420') + '/oauth';
 // The URL for this server for the oauth callback
 const THIS_URL = process.env.THIS_URL || 'http://localhost:3000/login';
 // The secret for the session data
 const FB_SECRET = process.env.FB_SECRET || 'secret';
+// The Formbar WebSocket URL for Digipog transactions
+const FORMBAR_URL = process.env.FORMBAR_URL || 'https://formbeta.yorktechapps.com';
+// The API key for Formbar
+const FORMBAR_API_KEY = process.env.FORMBAR_API_KEY;
 
 const app = express();
 
@@ -39,6 +45,9 @@ app.set('view engine', 'ejs');
 
 // set express to use public for static files
 app.use(express.static(__dirname + '/public'));
+
+// parse JSON bodies for POST requests
+app.use(express.json());
 
 // create a session middleware with a secret key
 const sessionMiddleware = session({
@@ -53,6 +62,44 @@ app.use(sessionMiddleware);
 // use the express-ws module to add websockets to express
 expressWs(app);
 
+// Connect to Formbar WS API for Digipog transactions
+const formbarSocket = io(FORMBAR_URL, {
+    extraHeaders: {
+        api: FORMBAR_API_KEY
+    }
+});
+
+// Track which users have paid to play
+const paidSessions = new Map();
+
+// Store pending purchase requests
+const pendingPurchases = new Map();
+
+// Handle Formbar connection
+formbarSocket.on("connect", () => {
+    log("Connected to Formbar Digipog API");
+});
+
+// Handle transfer responses from Formbar
+formbarSocket.on("transferResponse", (response) => {
+    log("Transfer Response:", response);
+    // Process all pending purchases (since we can't reliably match by ID from response)
+    // In practice, there should only be one or a few at a time
+    for (const [userId, pending] of pendingPurchases.entries()) {
+        // Call the callback with the response
+        pending.callback(response);
+        // Remove this pending purchase
+        pendingPurchases.delete(userId);
+        // Only process one response at a time
+        break;
+    }
+});
+
+// Handle Formbar disconnection
+formbarSocket.on("disconnect", () => {
+    log("Disconnected from Formbar Digipog API");
+});
+
 // This function is used to intercept page loads to check if the user is authenticated
 function isAuthenticated(req, res, next) {
     if (req.session.user) next()
@@ -61,10 +108,11 @@ function isAuthenticated(req, res, next) {
 
 // Define a route handler for the default home page
 app.get('/', (req, res) => {
-    let user = { name: "", fbid: 0 };
+    let user = { name: "", fbid: 0, hasSavedPin: false };
     if (req.session.user) {
         user = req.session.user
         user.top_score = 0;
+        user.hasSavedPin = !!req.session.savedPin;
         // get the user from the database
         db.get(`SELECT * FROM users WHERE fb_id = ? ;`, [req.session.user.fbid], (err, row) => {
             if (err) { // if there was an error, log it
@@ -81,12 +129,12 @@ app.get('/', (req, res) => {
                 });
             }
             // render the home page with the stats we've found
-            res.render('info', { numPlayers: clients.length, game: game.stats, user: user });
+            res.render('info', { numPlayers: clients.length, game: game.stats, user: user, error: req.query.error });
 
         });
     } else {
         // render the home page without user stats
-        res.render('info', { numPlayers: clients.length, game: game.stats, user: user });
+        res.render('info', { numPlayers: clients.length, game: game.stats, user: user, error: req.query.error });
     };
     // add 1 to the hits_home column in the database
     db.run(`UPDATE general SET hits_home = hits_home + 1 WHERE uid = 1 ;`, (err) => {
@@ -100,6 +148,22 @@ app.get('/', (req, res) => {
 
 // game page
 app.get('/game', (req, res) => {
+    // check if user is logged in
+    if (!req.session.user) {
+        return res.redirect('/?error=login');
+    }
+
+    const userId = req.session.user.fbid;
+    
+    // check if user has paid
+    if (!paidSessions.has(userId) || !paidSessions.get(userId).paid) {
+        return res.redirect('/?error=payment');
+    }
+
+    // CONSUME the payment - they need to pay again next time
+    paidSessions.delete(userId);
+    log(`User ${req.session.user.name} consumed their payment to enter the game`);
+
     // create a blank user object in case there is no session user
     let user = { name: "", fbid: 0 };
     // if there is a session user, set the user object to the session user
@@ -123,13 +187,67 @@ app.get('/login', (req, res) => {
         // decode the token and set the session token and user
         let tokenData = jwt.decode(req.query.token);
         req.session.token = tokenData;
-        req.session.user = { name: tokenData.username, fbid: tokenData.id };
+        req.session.user = { name: tokenData.displayName, fbid: tokenData.id };
         // redirect to the home page
         res.redirect('/');
     } else {
         // send them to the Formbar login page
         res.redirect(`${AUTH_URL}?redirectURL=${THIS_URL}`);
     };
+});
+
+// purchase route - handle Digipog payments for game entry
+app.post('/purchase', (req, res) => {
+    // check if user is logged in
+    if (!req.session.user) {
+        return res.json({ success: false, message: "You must be logged in to purchase" });
+    }
+
+    let { pin, savePIN, useSaved } = req.body;
+    
+    // if using saved PIN, get it from session
+    if (useSaved && req.session.savedPin) {
+        pin = req.session.savedPin;
+    }
+    
+    // validate pin
+    if (!pin || typeof pin !== 'number') {
+        return res.json({ success: false, message: "Invalid PIN" });
+    }
+
+    const userId = req.session.user.fbid;
+
+    // prepare transfer data
+    const transferData = {
+        from: userId,
+        to: 22,
+        amount: 25,
+        reason: "suck game entry",
+        pin: pin,
+        pool: true
+    };
+
+    // store the request so we can handle the response
+    pendingPurchases.set(userId, {
+        callback: (response) => {
+            if (response.success) {
+                // mark user as paid
+                paidSessions.set(userId, { paid: true, timestamp: new Date() });
+                
+                // save PIN if requested
+                if (savePIN) {
+                    req.session.savedPin = pin;
+                }
+                
+                res.json({ success: true, message: "Payment successful! Redirecting to game..." });
+            } else {
+                res.json({ success: false, message: response.message || "Payment failed" });
+            }
+        }
+    });
+
+    // emit the transfer request to Formbar
+    formbarSocket.emit("transferDigipogs", transferData);
 });
 
 // create a new game instance
@@ -146,8 +264,8 @@ setInterval(() => {
         // update the number of players in the game object
         game.numPlayers = clients.length;
 
-        // update the game state
-        game.step();
+        // update the game state and get list of dead players
+        const deadPlayers = game.step();
 
         // send the update message to each client
         for (const client of clients) {
@@ -191,6 +309,24 @@ setInterval(() => {
                     log('Updated stats in database.');
                 }
             });
+        }
+        
+        // handle dead players
+        if (deadPlayers && deadPlayers.length > 0) {
+            for (const deadPlayerId of deadPlayers) {
+                // find the client with this id
+                const deadClient = clients.find(c => c.id === deadPlayerId);
+                if (deadClient) {
+                    // send death message
+                    deadClient.send(JSON.stringify({ death: true, message: "You died! Returning to lobby..." }));
+                    
+                    // remove from paid sessions if they have a user
+                    if (deadClient.user) {
+                        paidSessions.delete(deadClient.user.fbid);
+                        log(`Player ${deadClient.user.name} died and was removed from paid sessions`);
+                    }
+                }
+            }
         }
     }
 

@@ -2,6 +2,41 @@
 const sqlite3 = require('sqlite3').verbose();
 const db = new sqlite3.Database('data/database.db');
 
+// import socket.io-client for Formbar Digipog API
+const io = require('socket.io-client');
+// import dotenv to load environment variables
+require('dotenv').config();
+
+// Load Formbar configuration from environment variables
+const FORMBAR_URL = process.env.FORMBAR_URL || 'https://formbeta.yorktechapps.com';
+const FORMBAR_API_KEY = process.env.FORMBAR_API_KEY;
+
+// Connect to Formbar WS API for Digipog transactions (awards)
+const formbarSocket = io(FORMBAR_URL, {
+    extraHeaders: {
+        api: FORMBAR_API_KEY
+    }
+});
+
+// Handle Formbar connection
+formbarSocket.on("connect", () => {
+    console.log("Connected to Formbar Digipog API for awards");
+});
+
+// Handle transfer responses from Formbar (for awards)
+formbarSocket.on("awardDigipogsResponse", (response) => {
+    if (response.success) {
+        console.log("Award successful -", response.message);
+    } else {
+        console.log("Award failed -", response.message);
+    }
+});
+
+// Handle Formbar disconnection
+formbarSocket.on("disconnect", () => {
+    console.log("Disconnected from Formbar Digipog API");
+});
+
 // Create a game class that will hold the game state
 class Game {
     constructor() {
@@ -13,6 +48,7 @@ class Game {
         this.blobs = [];
         this.blobLimit = () => { return ((this.gameWidth + this.gameHeight) / 2) / 10 };
         this.blobAbsorb = 0.1;
+        this.awardPercentage = 0.1;
         this.baddyChance = 0.3;
         this.maxSize = 50;
         this.numPlayers = 0;
@@ -44,6 +80,9 @@ class Game {
         // Adjust for the number of players
         this.gameWidth = 2000 + (this.numPlayers * this.additionalSpace);
         this.gameHeight = 2000 + (this.numPlayers * this.additionalSpace);
+
+        // Track dead players to return
+        const deadPlayers = [];
 
         let top = {
             score: 0,
@@ -103,6 +142,14 @@ class Game {
                     });
                     blob.top_score = blob.r;
                 }
+
+                // check if player has died (reached minimum size)
+                // Don't allow death during spawn protection
+                if (blob.r <= 10 && !blob.isDead && !blob.isProtected()) {
+                    blob.isDead = true;
+                    deadPlayers.push(blob.id);
+                    console.log(`Player ${blob.name} has died`);
+                }
             }
 
             // move the blob
@@ -112,17 +159,44 @@ class Game {
             for (const cblob of this.blobs) {
                 // if the blob contains another blob and they are both alive
                 if (blob.containsBlob(cblob) && blob.alive && cblob.alive) {
+                    // Check if the eating blob (blob) is a protected player
+                    const blobIsProtectedPlayer = blob.type === "player" && blob.isProtected();
+                    // Check if the victim blob (cblob) is a protected player
+                    const cblobIsProtectedPlayer = cblob.type === "player" && cblob.isProtected();
+
+                    // Skip collision if the victim is a protected player
+                    if (cblobIsProtectedPlayer) {
+                        continue;
+                    }
+
                     if (
                         (cblob.type === "baddy" && blob.type === "baddy") // if both blobs are baddies
                         || cblob.type !== "baddy" || cblob.r < 8 // or if the other blob is not a baddy or is smaller than 8
                     ) {
                         // absorb the other blob
                         blob.r += cblob.r * this.blobAbsorb
+                        
+                        // if a player ate another player, award Digipogs
+                        if (blob.type === "player" && cblob.type === "player" && blob.fbid && cblob.fbid) {
+                            const awardAmount = Math.round(cblob.r * this.awardPercentage);
+                            if (awardAmount > 0) {
+                                const awardData = {
+                                    from: 1, 
+                                    to: blob.fbid,
+                                    amount: awardAmount
+                                };
+                                formbarSocket.emit("awardDigipogs", awardData);
+                                console.log(`Awarding ${awardData.amount} Digipogs to ${awardData.to} for defeating ${cblob.name}`);
+                            }
+                        }
+                        
                         // set the blob to not alive for next frame
                         cblob.alive = false;
                     } else {
-                        //shrink both blobs
-                        blob.r -= cblob.r * this.blobAbsorb
+                        // Would shrink both blobs, but skip if eating blob is protected
+                        if (!blobIsProtectedPlayer) {
+                            blob.r -= cblob.r * this.blobAbsorb
+                        }
                         cblob.r -= cblob.r * this.blobAbsorb
                     }
 
@@ -151,6 +225,9 @@ class Game {
                 }
             }
         }
+
+        // Return list of dead player IDs
+        return deadPlayers;
     }
 }
 
@@ -225,11 +302,26 @@ class Player extends Blob {
         // Generate a random color for the blob
         this.color = "#" + Math.floor(Math.random() * 16777215).toString(16);
         this.name = this.makeName();
+        this.isDead = false;
+        this.spawnTime = Date.now(); // Track when player spawned
+        this.spawnProtectionDuration = 5000; // 5 seconds of protection
         this.vision = {
             width: 0,
             height: 0,
             multi: 1
         }
+    }
+
+    // Check if player is still protected (within 5 seconds of spawning)
+    isProtected() {
+        return (Date.now() - this.spawnTime) < this.spawnProtectionDuration;
+    }
+
+    // Override pack to include protection status
+    pack() {
+        const baseData = super.pack();
+        baseData.isProtected = this.isProtected();
+        return baseData;
     }
 
     canSee(blob) {

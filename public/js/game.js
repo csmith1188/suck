@@ -16,6 +16,15 @@ ws.onopen = () => {
 ws.onmessage = (message) => {
     message = JSON.parse(message.data);
 
+    // Check if this is a death message
+    if (message.death) {
+        alert(message.message || "You died! Returning to lobby...");
+        setTimeout(() => {
+            window.location.href = '/';
+        }, 2000);
+        return;
+    }
+
     // See if you're receiving your ID
     if (message.id) {
         ws.id = message.id;
@@ -28,8 +37,8 @@ ws.onmessage = (message) => {
             gameState = Date.now();
             // listen for clicks
             canvas.addEventListener('click', () => {
-                // reload the page
-                location.reload();
+                // go back to /
+                window.location.href = '/';
             });
         } else {
             camera.target = player;
@@ -39,8 +48,8 @@ ws.onmessage = (message) => {
             blobs = [];
             // Add each blob from the message to the blobs array
             for (const blob of message.update.nearbyBlobs) {
-                blobs.push(new Blob(blob.x, blob.y, blob.r, blob.id, blob.type, blob.name));
-                this.blobs[this.blobs.length - 1].color = blob.color;
+                blobs.push(new Blob(blob.x, blob.y, blob.r, blob.id, blob.type, blob.name, blob.isProtected));
+                blobs[blobs.length - 1].color = blob.color;
             }
         }
     }
@@ -54,7 +63,7 @@ ws.onclose = () => {
 
 // Create a Blob class with the usually movement properties
 class Blob {
-    constructor(x, y, r, id = "", type = "blob", name = "") {
+    constructor(x, y, r, id = "", type = "blob", name = "", isProtected = false) {
         this.id = id;
         this.x = x;
         this.y = y;
@@ -62,6 +71,7 @@ class Blob {
         this.type = type;
         this.name = name;
         this.color = "#000000"
+        this.isProtected = isProtected;
     }
 
     // Draw the blob on the canvas
@@ -81,7 +91,18 @@ class Blob {
             0, 2 * Math.PI);
         ctx.fillStyle = this.color;
         ctx.fill();
-        ctx.stroke();
+        
+        // If this is a protected player, add a pulsing shield outline
+        if (this.type === "player" && this.isProtected) {
+            const pulse = Math.sin(Date.now() / 200) * 0.3 + 0.7; // Pulsing effect
+            ctx.strokeStyle = `rgba(0, 255, 255, ${pulse})`;
+            ctx.lineWidth = 4;
+            ctx.stroke();
+            ctx.strokeStyle = 'black';
+            ctx.lineWidth = 1;
+        } else {
+            ctx.stroke();
+        }
         // if this type is player, write their name above them
         if (this.type === "player") {
             ctx.font = Math.min(parseInt(30 * camera.multiplier), 30) + 'px BubbleGums';
