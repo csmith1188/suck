@@ -1,6 +1,5 @@
 // find the ip address of the server by replacing the https or http with ws
-let host = window.location.href.replace("http", "ws");
-if (host.includes("wss")) host = host.replace("wss", "ws");
+let host = window.location.href.replace("https", "wss").replace("http", "ws");
 host = host.replace("game", "");
 host += 'game';
 
